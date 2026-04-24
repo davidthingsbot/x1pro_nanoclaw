@@ -9,12 +9,12 @@ import path from 'path';
 import {
   CONTAINER_IMAGE,
   CONTAINER_MAX_OUTPUT_SIZE,
+  CONTAINER_NAME_PREFIX,
   CONTAINER_TIMEOUT,
   DATA_DIR,
   GROUPS_DIR,
   IDLE_TIMEOUT,
-  ONECLI_API_KEY,
-  ONECLI_URL,
+  getOnecliGateway,
   TIMEZONE,
 } from './config.js';
 import { resolveGroupFolderPath, resolveGroupIpcPath } from './group-folder.js';
@@ -25,11 +25,8 @@ import {
   readonlyMountArgs,
   stopContainer,
 } from './container-runtime.js';
-import { OneCLI } from '@onecli-sh/sdk';
 import { validateAdditionalMounts } from './mount-security.js';
 import { RegisteredGroup } from './types.js';
-
-const onecli = new OneCLI({ url: ONECLI_URL, apiKey: ONECLI_API_KEY });
 
 // Sentinel markers for robust output parsing (must match agent-runner)
 const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
@@ -243,29 +240,43 @@ function buildVolumeMounts(
   return mounts;
 }
 
-async function buildContainerArgs(
+function buildContainerArgs(
   mounts: VolumeMount[],
   containerName: string,
-  agentIdentifier?: string,
-): Promise<string[]> {
+): string[] {
   const args: string[] = ['run', '-i', '--rm', '--name', containerName];
 
   // Pass host timezone so container's local time matches the user's
   args.push('-e', `TZ=${TIMEZONE}`);
 
-  // OneCLI gateway handles credential injection — containers never see real secrets.
-  // The gateway intercepts HTTPS traffic and injects API keys or OAuth tokens.
-  const onecliApplied = await onecli.applyContainerConfig(args, {
-    addHostMapping: false, // Nanoclaw already handles host gateway
-    agent: agentIdentifier,
-  });
-  if (onecliApplied) {
-    logger.info({ containerName }, 'OneCLI gateway config applied');
-  } else {
-    logger.warn(
-      { containerName },
-      'OneCLI gateway not reachable — container will have no credentials',
-    );
+  // OneCLI gateway acts as an HTTPS proxy — it intercepts traffic to
+  // api.anthropic.com and injects real credentials on the wire.
+  // Containers need proxy env vars, a placeholder API key, and the CA cert.
+  const onecliGateway = getOnecliGateway();
+  if (onecliGateway) {
+    args.push('-e', `HTTPS_PROXY=${onecliGateway.proxyUrl}`);
+    args.push('-e', `HTTP_PROXY=${onecliGateway.proxyUrl}`);
+    args.push('-e', `https_proxy=${onecliGateway.proxyUrl}`);
+    args.push('-e', `http_proxy=${onecliGateway.proxyUrl}`);
+    // Placeholder key must pass Claude Code's sk-ant-* format validation.
+    // The proxy replaces it with the real key on the wire.
+    args.push('-e', 'ANTHROPIC_API_KEY=sk-ant-onecli-proxy');
+    // Tell Node.js to route requests through the proxy env vars
+    args.push('-e', 'NODE_USE_ENV_PROXY=1');
+    // Mount CA cert and point Node + common tools at it
+    const containerCaPath = '/etc/onecli/gateway-ca.pem';
+    args.push(...readonlyMountArgs(onecliGateway.caCertPath, containerCaPath));
+    args.push('-e', `NODE_EXTRA_CA_CERTS=${containerCaPath}`);
+    args.push('-e', `SSL_CERT_FILE=${containerCaPath}`);
+    args.push('-e', `REQUESTS_CA_BUNDLE=${containerCaPath}`);
+    args.push('-e', `CURL_CA_BUNDLE=${containerCaPath}`);
+    // Git: trust the proxy CA, disable credential prompts, use basic auth
+    args.push('-e', `GIT_SSL_CAINFO=${containerCaPath}`);
+    args.push('-e', 'GIT_TERMINAL_PROMPT=0');
+    args.push('-e', 'GIT_HTTP_PROXY_AUTHMETHOD=basic');
+    // GitHub CLI: placeholder token so gh sends Authorization header
+    // that the proxy can intercept and replace with the real PAT.
+    args.push('-e', 'GH_TOKEN=placeholder');
   }
 
   // Runtime-specific args for host gateway resolution
@@ -307,16 +318,8 @@ export async function runContainerAgent(
 
   const mounts = buildVolumeMounts(group, input.isMain);
   const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');
-  const containerName = `nanoclaw-${safeName}-${Date.now()}`;
-  // Main group uses the default OneCLI agent; others use their own agent.
-  const agentIdentifier = input.isMain
-    ? undefined
-    : group.folder.toLowerCase().replace(/_/g, '-');
-  const containerArgs = await buildContainerArgs(
-    mounts,
-    containerName,
-    agentIdentifier,
-  );
+  const containerName = `${CONTAINER_NAME_PREFIX}-${safeName}-${Date.now()}`;
+  const containerArgs = buildContainerArgs(mounts, containerName);
 
   logger.debug(
     {

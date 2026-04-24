@@ -10,12 +10,12 @@ const OUTPUT_END_MARKER = '---NANOCLAW_OUTPUT_END---';
 vi.mock('./config.js', () => ({
   CONTAINER_IMAGE: 'nanoclaw-agent:latest',
   CONTAINER_MAX_OUTPUT_SIZE: 10485760,
+  CONTAINER_NAME_PREFIX: 'nanoclaw',
   CONTAINER_TIMEOUT: 1800000, // 30min
   DATA_DIR: '/tmp/nanoclaw-test-data',
   GROUPS_DIR: '/tmp/nanoclaw-test-groups',
   IDLE_TIMEOUT: 1800000, // 30min
-  ONECLI_API_KEY: '',
-  ONECLI_URL: 'http://localhost:10254',
+  getOnecliGateway: () => undefined,
   TIMEZONE: 'America/Los_Angeles',
 }));
 
@@ -58,17 +58,6 @@ vi.mock('./container-runtime.js', () => ({
   hostGatewayArgs: () => [],
   readonlyMountArgs: (h: string, c: string) => ['-v', `${h}:${c}:ro`],
   stopContainer: vi.fn(),
-}));
-
-// Mock OneCLI SDK
-vi.mock('@onecli-sh/sdk', () => ({
-  OneCLI: class {
-    applyContainerConfig = vi.fn().mockResolvedValue(true);
-    createAgent = vi.fn().mockResolvedValue({ id: 'test' });
-    ensureAgent = vi
-      .fn()
-      .mockResolvedValue({ name: 'test', identifier: 'test', created: true });
-  },
 }));
 
 // Create a controllable fake ChildProcess

@@ -1,3 +1,4 @@
+import { execSync } from 'child_process';
 import os from 'os';
 import path from 'path';
 
@@ -8,9 +9,11 @@ import { isValidTimezone } from './timezone.js';
 const envConfig = readEnvFile([
   'ASSISTANT_NAME',
   'ASSISTANT_HAS_OWN_NUMBER',
-  'ONECLI_URL',
-  'ONECLI_API_KEY',
+  'NANOCLAW_CONFIG_DIR',
+  'NANOCLAW_CONTAINER_PREFIX',
   'TZ',
+  'ONECLI_URL',
+  'ONECLI_AGENT',
 ]);
 
 export const ASSISTANT_NAME =
@@ -26,16 +29,17 @@ const PROJECT_ROOT = process.cwd();
 const HOME_DIR = process.env.HOME || os.homedir();
 
 // Mount security: allowlist stored OUTSIDE project root, never mounted into containers
+// Per-install override via NANOCLAW_CONFIG_DIR (absolute path). Defaults to ~/.config/nanoclaw.
+const CONFIG_DIR =
+  process.env.NANOCLAW_CONFIG_DIR ||
+  envConfig.NANOCLAW_CONFIG_DIR ||
+  path.join(HOME_DIR, '.config', 'nanoclaw');
 export const MOUNT_ALLOWLIST_PATH = path.join(
-  HOME_DIR,
-  '.config',
-  'nanoclaw',
+  CONFIG_DIR,
   'mount-allowlist.json',
 );
 export const SENDER_ALLOWLIST_PATH = path.join(
-  HOME_DIR,
-  '.config',
-  'nanoclaw',
+  CONFIG_DIR,
   'sender-allowlist.json',
 );
 export const STORE_DIR = path.resolve(PROJECT_ROOT, 'store');
@@ -44,6 +48,11 @@ export const DATA_DIR = path.resolve(PROJECT_ROOT, 'data');
 
 export const CONTAINER_IMAGE =
   process.env.CONTAINER_IMAGE || 'nanoclaw-agent:latest';
+// Container name prefix — lets multiple NanoClaw installs coexist without killing each other's containers.
+export const CONTAINER_NAME_PREFIX =
+  process.env.NANOCLAW_CONTAINER_PREFIX ||
+  envConfig.NANOCLAW_CONTAINER_PREFIX ||
+  'nanoclaw';
 export const CONTAINER_TIMEOUT = parseInt(
   process.env.CONTAINER_TIMEOUT || '1800000',
   10,
@@ -52,9 +61,6 @@ export const CONTAINER_MAX_OUTPUT_SIZE = parseInt(
   process.env.CONTAINER_MAX_OUTPUT_SIZE || '10485760',
   10,
 ); // 10MB default
-export const ONECLI_URL = process.env.ONECLI_URL || envConfig.ONECLI_URL;
-export const ONECLI_API_KEY =
-  process.env.ONECLI_API_KEY || envConfig.ONECLI_API_KEY;
 export const MAX_MESSAGES_PER_PROMPT = Math.max(
   1,
   parseInt(process.env.MAX_MESSAGES_PER_PROMPT || '10', 10) || 10,
@@ -82,6 +88,78 @@ export function getTriggerPattern(trigger?: string): RegExp {
 }
 
 export const TRIGGER_PATTERN = buildTriggerPattern(DEFAULT_TRIGGER);
+
+// OneCLI gateway acts as an HTTPS proxy that intercepts API traffic and
+// injects real credentials. Containers need: HTTPS_PROXY/HTTP_PROXY with
+// the agent token, a placeholder ANTHROPIC_API_KEY, and the gateway CA cert.
+export interface OnecliGatewayConfig {
+  /** Proxy URL for containers: http://x:<token>@host.docker.internal:<port> */
+  proxyUrl: string;
+  /** Host path to the gateway CA cert (mounted read-only into containers) */
+  caCertPath: string;
+}
+
+// Lazy-resolved: computed on first access (not at module load) so the OneCLI
+// gateway has time to become healthy after a simultaneous restart.
+let _onecliGateway: OnecliGatewayConfig | undefined | null = null; // null = not yet resolved
+
+function resolveOnecliGateway(): OnecliGatewayConfig | undefined {
+  const dashboardUrl = process.env.ONECLI_URL || envConfig.ONECLI_URL;
+  if (!dashboardUrl) return undefined;
+  try {
+    const url = new URL(dashboardUrl);
+    const gatewayPort = parseInt(url.port, 10) + 1;
+
+    // Resolve the OneCLI agent token. ONECLI_AGENT names a specific agent
+    // (by identifier) so multiple NanoClaw instances can share one gateway.
+    // Falls back to the default agent when unset.
+    const agentIdentifier =
+      process.env.ONECLI_AGENT || envConfig.ONECLI_AGENT || '';
+    let accessToken: string | undefined;
+
+    if (agentIdentifier) {
+      const raw = execSync('onecli agents list', {
+        encoding: 'utf-8',
+        timeout: 5000,
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+      const parsed = JSON.parse(raw);
+      const agents: Array<{ identifier: string; accessToken: string }> =
+        parsed.data || parsed;
+      const match = agents.find((a) => a.identifier === agentIdentifier);
+      accessToken = match?.accessToken;
+    } else {
+      const raw = execSync('onecli agents get-default', {
+        encoding: 'utf-8',
+        timeout: 5000,
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+      accessToken = JSON.parse(raw).accessToken;
+    }
+
+    if (!accessToken) return undefined;
+
+    const caCertPath = path.join(
+      process.env.HOME || os.homedir(),
+      '.onecli',
+      'gateway-ca.pem',
+    );
+
+    return {
+      proxyUrl: `http://x:${accessToken}@host.docker.internal:${gatewayPort}`,
+      caCertPath,
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+export function getOnecliGateway(): OnecliGatewayConfig | undefined {
+  if (_onecliGateway === null) {
+    _onecliGateway = resolveOnecliGateway();
+  }
+  return _onecliGateway;
+}
 
 // Timezone for scheduled tasks, message formatting, etc.
 // Validates each candidate is a real IANA identifier before accepting.
