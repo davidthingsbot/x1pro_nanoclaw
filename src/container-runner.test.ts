@@ -15,9 +15,20 @@ vi.mock('./config.js', () => ({
   DATA_DIR: '/tmp/nanoclaw-test-data',
   GROUPS_DIR: '/tmp/nanoclaw-test-groups',
   IDLE_TIMEOUT: 1800000, // 30min
-  getOnecliGateway: () => undefined,
+  ONECLI_URL: undefined,
+  ONECLI_API_KEY: undefined,
+  ONECLI_AGENT: '',
   TIMEZONE: 'America/Los_Angeles',
 }));
+
+// Mock OneCLI SDK — gateway is not available in tests
+vi.mock('@onecli-sh/sdk', () => {
+  return {
+    OneCLI: class {
+      applyContainerConfig = vi.fn().mockResolvedValue(false);
+    },
+  };
+});
 
 // Mock logger
 vi.mock('./logger.js', () => ({

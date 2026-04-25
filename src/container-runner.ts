@@ -14,7 +14,9 @@ import {
   DATA_DIR,
   GROUPS_DIR,
   IDLE_TIMEOUT,
-  getOnecliGateway,
+  ONECLI_AGENT,
+  ONECLI_API_KEY,
+  ONECLI_URL,
   TIMEZONE,
 } from './config.js';
 import { resolveGroupFolderPath, resolveGroupIpcPath } from './group-folder.js';
@@ -25,8 +27,11 @@ import {
   readonlyMountArgs,
   stopContainer,
 } from './container-runtime.js';
+import { OneCLI } from '@onecli-sh/sdk';
 import { validateAdditionalMounts } from './mount-security.js';
 import { RegisteredGroup } from './types.js';
+
+const onecli = new OneCLI({ url: ONECLI_URL, apiKey: ONECLI_API_KEY });
 
 // Sentinel markers for robust output parsing (must match agent-runner)
 const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
@@ -77,7 +82,6 @@ function buildVolumeMounts(
     });
 
     // Shadow .env so the agent cannot read secrets from the mounted project root.
-    // Credentials are injected by the OneCLI gateway, never exposed to containers.
     const envFile = path.join(projectRoot, '.env');
     if (fs.existsSync(envFile)) {
       mounts.push({
@@ -240,43 +244,47 @@ function buildVolumeMounts(
   return mounts;
 }
 
-function buildContainerArgs(
+async function buildContainerArgs(
   mounts: VolumeMount[],
   containerName: string,
-): string[] {
+): Promise<string[]> {
   const args: string[] = ['run', '-i', '--rm', '--name', containerName];
 
   // Pass host timezone so container's local time matches the user's
   args.push('-e', `TZ=${TIMEZONE}`);
 
-  // OneCLI gateway acts as an HTTPS proxy — it intercepts traffic to
-  // api.anthropic.com and injects real credentials on the wire.
-  // Containers need proxy env vars, a placeholder API key, and the CA cert.
-  const onecliGateway = getOnecliGateway();
-  if (onecliGateway) {
-    args.push('-e', `HTTPS_PROXY=${onecliGateway.proxyUrl}`);
-    args.push('-e', `HTTP_PROXY=${onecliGateway.proxyUrl}`);
-    args.push('-e', `https_proxy=${onecliGateway.proxyUrl}`);
-    args.push('-e', `http_proxy=${onecliGateway.proxyUrl}`);
-    // Placeholder key must pass Claude Code's sk-ant-* format validation.
-    // The proxy replaces it with the real key on the wire.
-    args.push('-e', 'ANTHROPIC_API_KEY=sk-ant-onecli-proxy');
-    // Tell Node.js to route requests through the proxy env vars
-    args.push('-e', 'NODE_USE_ENV_PROXY=1');
-    // Mount CA cert and point Node + common tools at it
-    const containerCaPath = '/etc/onecli/gateway-ca.pem';
-    args.push(...readonlyMountArgs(onecliGateway.caCertPath, containerCaPath));
-    args.push('-e', `NODE_EXTRA_CA_CERTS=${containerCaPath}`);
-    args.push('-e', `SSL_CERT_FILE=${containerCaPath}`);
-    args.push('-e', `REQUESTS_CA_BUNDLE=${containerCaPath}`);
-    args.push('-e', `CURL_CA_BUNDLE=${containerCaPath}`);
-    // Git: trust the proxy CA, disable credential prompts, use basic auth
-    args.push('-e', `GIT_SSL_CAINFO=${containerCaPath}`);
-    args.push('-e', 'GIT_TERMINAL_PROMPT=0');
-    args.push('-e', 'GIT_HTTP_PROXY_AUTHMETHOD=basic');
-    // GitHub CLI: placeholder token so gh sends Authorization header
-    // that the proxy can intercept and replace with the real PAT.
-    args.push('-e', 'GH_TOKEN=placeholder');
+  // OneCLI gateway handles credential injection — containers never see real secrets.
+  // The SDK sets HTTPS_PROXY, CA cert mount, placeholder ANTHROPIC_API_KEY, etc.
+  // ONECLI_AGENT scopes credentials to this instance when sharing one gateway.
+  const agentIdentifier = ONECLI_AGENT || undefined;
+  try {
+    const onecliApplied = await onecli.applyContainerConfig(args, {
+      addHostMapping: false, // NanoClaw already handles host gateway
+      agent: agentIdentifier,
+    });
+    if (onecliApplied) {
+      logger.info({ containerName }, 'OneCLI gateway config applied');
+      // Supplemental env vars the SDK doesn't set.
+      // GIT_SSL_CAINFO: git must trust the proxy CA for HTTPS clones.
+      // REQUESTS_CA_BUNDLE / CURL_CA_BUNDLE: Python requests and curl.
+      // GH_TOKEN: placeholder so gh sends an Authorization header the
+      //   proxy can intercept and replace with the real PAT.
+      const caCertPath = '/tmp/onecli-gateway-ca.pem';
+      args.push('-e', `GIT_SSL_CAINFO=${caCertPath}`);
+      args.push('-e', `REQUESTS_CA_BUNDLE=${caCertPath}`);
+      args.push('-e', `CURL_CA_BUNDLE=${caCertPath}`);
+      args.push('-e', 'GH_TOKEN=placeholder');
+    } else {
+      logger.warn(
+        { containerName },
+        'OneCLI gateway not reachable — container will have no credentials',
+      );
+    }
+  } catch (err) {
+    logger.warn(
+      { containerName, err },
+      'OneCLI gateway error — container will have no credentials',
+    );
   }
 
   // Runtime-specific args for host gateway resolution
@@ -319,7 +327,7 @@ export async function runContainerAgent(
   const mounts = buildVolumeMounts(group, input.isMain);
   const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');
   const containerName = `${CONTAINER_NAME_PREFIX}-${safeName}-${Date.now()}`;
-  const containerArgs = buildContainerArgs(mounts, containerName);
+  const containerArgs = await buildContainerArgs(mounts, containerName);
 
   logger.debug(
     {
